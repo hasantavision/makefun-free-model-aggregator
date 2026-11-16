@@ -1,5 +1,9 @@
 # Free model aggregator
 
+[![make.fun · free-model-aggregator-01](https://make.fun/badge/free-model-aggregator-01.svg)](https://make.fun/bounty/free-model-aggregator-01)
+[![rank](https://make.fun/badge/free-model-aggregator-01/hasantavision/makefun-free-model-aggregator/rank.svg)](https://make.fun/bounty/free-model-aggregator-01/leaderboard)
+[![reward](https://make.fun/badge/free-model-aggregator-01/hasantavision/makefun-free-model-aggregator/reward.svg)](https://make.fun/bounty/free-model-aggregator-01)
+
 This entry for Make.fun's `free-model-aggregator-01` uses Node's standard library. The challenge entrypoint is `main.ts`, which targets the kit's Node 22.23.4 runtime with built-in TypeScript stripping.
 
 ## Run
