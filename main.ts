@@ -46,6 +46,7 @@ const messagePath = { openai: '/v1/chat/completions', anthropic: '/v1/messages' 
 const defaultAnthropicVersion = '2023-06-01';
 const maxRequestBytes = 16 * 1024 * 1024;
 const maxAnswerBytes = 8 * 1024 * 1024;
+const longContextTokens = 200_000;
 const authHeaders: Record<string, string> = { bearer: 'authorization', 'x-api-key': 'x-api-key', 'x-goog-api-key': 'x-goog-api-key' };
 
 const isObject = (value: unknown): value is Json => !!value && typeof value === 'object' && !Array.isArray(value);
@@ -774,14 +775,19 @@ function requestRequirements(conversation: Conversation, manifest: Requirements)
   };
 }
 
-function accepts(candidate: Candidate, requirements: Requirements, conversation: Conversation, wire: ClientWire, body: Json): boolean {
-  const { provider, model, rating } = candidate;
+function supports({ model, rating }: Candidate, requirements: Requirements): boolean {
   const context = Math.min(model.context_length ?? Infinity, rating.context_length);
   if (context < (requirements.min_context ?? 0)) return false;
   if (requirements.tools && !rating.tools || requirements.vision && !rating.vision || requirements.json && !rating.json) return false;
+  return true;
+}
+
+function accepts(candidate: Candidate, requirements: Requirements, conversation: Conversation, wire: ClientWire, body: Json): boolean {
+  const { provider } = candidate;
+  if (provider.retired || !supports(candidate, requirements)) return false;
   if (wire === 'openai' && conversation.format && provider.wire === 'anthropic') return false;
   if (wire === 'openai' && (body.n > 1 || body.logprobs === true) && provider.wire !== wire) return false;
-  return !provider.retired;
+  return true;
 }
 
 function updateHealth(provider: Provider, error: unknown, ordinal: number): void {
@@ -845,6 +851,13 @@ function apiError(wire: ClientWire, status: number, message: string): Routed {
 function createRouter(origin: string, providers: Provider[], ratings: RatedModel[], manifest: ManifestEntry[]) {
   const candidates = ratedCandidates(providers, ratings);
   const byId = new Map(manifest.map(entry => [entry.id, entry]));
+  const bestById = new Map(manifest.map(entry => [entry.id, Math.max(0, ...candidates
+    .filter(candidate => supports(candidate, entry.requires)).map(candidate => candidate.rating.rating_milli))]));
+  const bound = manifest.reduce((total, entry) => total + entry.weight * bestById.get(entry.id)!, 0);
+  // Spend up to 1.5% of the weighted quality bound, leaving 0.5% for fallbacks.
+  const discretionaryLoss = Math.floor(3 * bound / 200);
+  const tried = new Set<Provider>();
+  let weightedLoss = 0;
   let ordinal = 0;
 
   return async (wire: ClientWire, body: Json, headers: IncomingMessage['headers']): Promise<Routed> => {
@@ -856,13 +869,26 @@ function createRouter(origin: string, providers: Provider[], ratings: RatedModel
     const sequence = ordinal++;
     const work = await getJson(origin + '/work').catch(() => null);
     const entry = byId.get(work?.next) ?? manifest[sequence];
-    const requirements = requestRequirements(conversation, entry?.api === wire && entry.stream === conversation.stream ? entry.requires : {});
+    const brief = entry?.api === wire && entry.stream === conversation.stream ? entry : undefined;
+    const requirements = requestRequirements(conversation, brief?.requires ?? {});
     const eligible = candidates.filter(candidate => accepts(candidate, requirements, conversation, wire, body));
+    const bestRating = brief ? bestById.get(brief.id) ?? 0 : 0;
+    const weight = brief?.weight ?? 0;
+    const loss = (rating: number) => weight * Math.max(0, bestRating - rating);
+    const ordered = bestPerProvider(eligible, wire, sequence);
+    if (bestRating && !requirements.vision && (requirements.min_context ?? 0) < longContextTokens) {
+      const freshIndex = ordered.findIndex(({ provider }) => !tried.has(provider));
+      if (freshIndex > 0 && weightedLoss + loss(ordered[freshIndex].rating.rating_milli) <= discretionaryLoss) {
+        ordered.unshift(ordered.splice(freshIndex, 1)[0]);
+      }
+    }
     const id = `makefun-${sequence + 1}`;
-    for (const candidate of bestPerProvider(eligible, wire, sequence)) {
+    for (const candidate of ordered) {
       const { provider } = candidate;
+      tried.add(provider);
       try {
         const reply = await invoke(candidate, wire, body, headers, conversation, id);
+        weightedLoss += loss(candidate.rating.rating_milli);
         provider.failures = 0;
         provider.retryAt = 0;
         return { status: 200, body: reply };
@@ -870,6 +896,7 @@ function createRouter(origin: string, providers: Provider[], ratings: RatedModel
         updateHealth(provider, error, sequence);
       }
     }
+    weightedLoss += loss(0);
     return apiError(wire, 503, eligible.length ? 'All eligible free providers failed' : 'No eligible free model is available');
   };
 }

@@ -134,6 +134,21 @@ test('routes to the highest-rated free model when a provider has models on both 
   assert.equal(answer.status, 200);
 });
 
+test('spends a bounded quality allowance on untried providers and falls back on a first-call refusal', async t => {
+  const rows = ['first', 'limited', 'close', 'other'].map(id => row(id, 'openai'));
+  const ratings = [1500, 1450, 1420, 1410].map((rating, index) => spec(rows[index].id, 'model', rating,
+    { vision: true, context_length: 250_000 }));
+  const { providers, calls } = await install(t, rows, ratings, (id, body) => id === 'limited'
+    ? json({ error: { message: 'Transient refusal' } }, 429) : json(completion(body.model)));
+  const manifest = [{}, { vision: true }, { min_context: 200_000 }, {}, {}, {}].map((requires, index) => ({
+    id: String(index), api: 'openai' as const, stream: false, requires, weight: 1,
+  }));
+  const route = createRouter(env, providers, ratings, manifest);
+  const body = { messages: [{ role: 'user', content: 'question' }] };
+  for (const _ of manifest) assert.equal((await route('openai', body, {})).status, 200);
+  assert.deepEqual(calls.map(call => call.id), ['first', 'first', 'first', 'limited', 'first', 'close', 'first']);
+});
+
 test('handles transient 429, tries one model per provider, and retires an exhausted provider', async t => {
   const rows = [row('best', 'openai', 'bearer'), row('backup', 'openai')];
   const ratings = [spec('best', 'high', 150), spec('best', 'low', 149), spec('backup', 'fallback', 140)];
